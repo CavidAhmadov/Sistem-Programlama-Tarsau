@@ -1,0 +1,519 @@
+#define _POSIX_C_SOURCE 200809L
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+/* Proje dokümanında belirtilen kısıtlamalar ve sabit değerler  18, 19, 34] */
+#define MAX_FILES 32              /* En fazla kabul edilecek giriş dosyası sayısı  19] */
+#define MAX_PATH_LEN 4096         /* Maksimum dosya yolu uzunluğu */
+#define MAX_TOTAL_SIZE (200UL * 1024UL * 1024UL) /* Maksimum toplam dosya boyutu (200 MB)  18] */
+#define HEADER_SIZE 10            /* Organizasyon bölümünün boyutunu tutan başlık alanı (10 bayt)  34] */
+
+/* Her bir arşiv girdisinin bilgilerini ve verisini tutan yapı (Struct)  36] */
+typedef struct {
+    char name[256];   /* Dosyanın adı  36] */
+    mode_t mode;      /* Dosyanın erişim izinleri (okuma/yazma/çalıştırma)  30, 36] */
+    size_t size;      /* Dosyanın bayt cinsinden boyutu  36] */
+    char *data;       /* Dosya içeriğinin bellekteki adresi  32] */
+} ArchiveEntry;
+
+/* Bir dosyanın yalnızca geçerli ASCII karakterlerden (0-127) oluşup oluşmadığını denetler  12] */
+static int is_ascii_text_file(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        return 0; /* Dosya açılamadıysa başarısız dön */
+    }
+
+    int ch;
+    /* Dosyanın sonuna kadar tüm karakterleri tek tek oku   */
+    while ((ch = fgetc(fp)) != EOF) {
+        /* Karakter 0-127 aralığı dışındaysa ASCII metin dosyası değildir  */
+        if (ch < 0 || ch > 127) {
+            fclose(fp);
+            return 0;
+        }
+    }
+
+    fclose(fp);
+    return 1; /* Dosya tamamen ASCII metindir   */
+}
+
+/* Belirtilen yoldaki dosyanın tüm içeriğini okuyup dinamik belleğe yükler */
+static char *read_file_contents(const char *path, size_t *out_size) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        return NULL;
+    }
+
+    /* Dosya boyutunu öğrenmek için imleci dosyanın sonuna götür */
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+
+    long len = ftell(fp);
+    if (len < 0) {
+        fclose(fp);
+        return NULL;
+    }
+
+    /* Okuma yapabilmek için imleci tekrar dosyanın başına getir */
+    if (fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+
+    /* Dosya boyutu + 1 (string sonu sıfırı için) kadar bellek ayır */
+    char *buf = malloc((size_t)len + 1);
+    if (!buf) {
+        fclose(fp);
+        return NULL;
+    }
+
+    /* Dosya içeriğini ayrılan belleğe oku */
+    size_t read_bytes = fread(buf, 1, (size_t)len, fp);
+    fclose(fp);
+
+    if (read_bytes != (size_t)len) {
+        free(buf);
+        return NULL;
+    }
+
+    buf[len] = '\0'; /* Metni güvenli bir string haline getir */
+    *out_size = (size_t)len;
+    return buf;
+}
+
+/* Dosya yolunun sonundaki sadece dosya adı kısmını ayıklar (Örn: "/var/log/t1.txt" -> "t1.txt") */
+static const char *base_name_only(const char *path) {
+    const char *slash = strrchr(path, '/');
+    if (slash) {
+        return slash + 1; /* Son eğik çizgiden sonrasını döndür */
+    }
+    return path; /* Eğik çizgi yoksa dosya adı zaten yalındır */
+}
+
+/* Belirtilen hedef dizinin var olup olmadığını kontrol eder, yoksa oluşturur   */
+static int ensure_directory(const char *dir) {
+    if (!dir || dir[0] == '\0') {
+        return 1;
+    }
+
+    struct stat st;
+    /* Dizin zaten var mı diye kontrol et */
+    if (stat(dir, &st) == 0) {
+        return S_ISDIR(st.st_mode); /* Klasör ise başarılı dön */
+    }
+
+    /* İstenen dizin adında boşluk varsa kural gereği reddet */
+    if (strchr(dir, ' ') != NULL) {
+        return 0;
+    }
+
+    /* Dizini 0755 (rwxr-xr-x) izinleriyle oluştur   */
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
+        return 0;
+    }
+
+    return 1;
+}
+
+/* Hafızada geçici olarak tutulan dosya içeriklerini serbest bırakır (Bellek sızıntısını önler) */
+static void free_entries(ArchiveEntry *entries, int count) {
+    for (int i = 0; i < count; i++) {
+        free(entries[i].data);
+    }
+}
+
+/* Verilen giriş dosyalarını okur, doğrular ve tek bir arşiv dosyası haline getirir   */
+static int build_archive(const char **inputs, int input_count, const char *output_path) {
+    ArchiveEntry entries[MAX_FILES];
+    int entry_count = 0;
+    size_t total_size = 0;
+
+    memset(entries, 0, sizeof(entries));
+
+    /* Tüm giriş dosyalarını tek tek işle */
+    for (int i = 0; i < input_count; i++) {
+        const char *input = inputs[i];
+        if (strcmp(input, "-o") == 0) {
+            continue;
+        }
+
+        /* Dosyanın ASCII olup olmadığını denetle  12] */
+        if (!is_ascii_text_file(input)) {
+            fprintf(stderr, "%s giriş dosyasının formatı uyumsuzdur!\n", input); /* */
+            free_entries(entries, entry_count);
+            return 1; /* Proje isterleri gereği çökmeden temiz çıkış yapılıyor  */
+        }
+
+        /* Dosya içeriğini oku */
+        size_t file_size = 0;
+        char *data = read_file_contents(input, &file_size);
+        if (!data) {
+            fprintf(stderr, "%s giriş dosyasının formatı uyumsuzdur!\n", input); /*  */
+            free_entries(entries, entry_count);
+            return 1;
+        }
+
+        /* Dosyanın izin (mode) bilgilerini almak için stat çağrısı yap   */
+        struct stat st;
+        if (stat(input, &st) != 0) {
+            free(data);
+            fprintf(stderr, "%s giriş dosyasının formatı uyumsuzdur!\n", input); /* */
+            free_entries(entries, entry_count);
+            return 1;
+        }
+
+        /* Toplam boyut 200 MB sınırını aşıyor mu kontrol et  */
+        total_size += file_size;
+        if (total_size > MAX_TOTAL_SIZE) {
+            free(data);
+            fprintf(stderr, "Giriş dosyalarının toplam boyutu 200 MB sınırını aşıyor!\n"); /*   */
+            free_entries(entries, entry_count);
+            return 1;
+        }
+
+        /* Bilgileri yapı dizisine (struct array) kaydet   */
+        strncpy(entries[entry_count].name, base_name_only(input),
+                sizeof(entries[entry_count].name) - 1);
+        entries[entry_count].mode = st.st_mode & 0777; /* Sadece erişim izinlerini al (Maskele)   */
+        entries[entry_count].size = file_size;
+        entries[entry_count].data = data;
+        entry_count++;
+    }
+
+    /* Organizasyon (meta-data) bölümünü oluşturma   */
+    size_t org_capacity = 256;
+    size_t org_len = 0;
+    char *org = malloc(org_capacity);
+    if (!org) {
+        free_entries(entries, entry_count);
+        return 1;
+    }
+    org[0] = '\0';
+
+    /* Her dosya için "|isim,izin,boyut|" formatında string üret ve birleştir  */
+    for (int i = 0; i < entry_count; i++) {
+        char record[512];
+        int written = snprintf(record, sizeof(record), "|%s,%o,%zu|",
+                               entries[i].name, entries[i].mode & 0777, entries[i].size); /*  */
+        if (written < 0 || (size_t)written >= sizeof(record)) {
+            free(org);
+            free_entries(entries, entry_count);
+            return 1;
+        }
+
+        /* Dinamik organizasyon stringi alanı yetersizse genişlet (realloc) */
+        if (org_len + (size_t)written + 1 > org_capacity) {
+            org_capacity = org_len + (size_t)written + 128;
+            char *tmp = realloc(org, org_capacity);
+            if (!tmp) {
+                free(org);
+                free_entries(entries, entry_count);
+                return 1;
+            }
+            org = tmp;
+        }
+
+        strcat(org, record);
+        org_len += (size_t)written;
+    }
+
+    /* Arşiv dosyasını yazma aşaması */
+    FILE *out = fopen(output_path, "wb");
+    if (!out) {
+        free(org);
+        free_entries(entries, entry_count);
+        return 1;
+    }
+
+    /* 1) İlk 10 bayta organizasyon bölümünün boyutunu soluna sıfır doldurarak yaz (Örn: 0000000045)*/
+    char header[HEADER_SIZE + 1];
+    snprintf(header, sizeof(header), "%010zu", org_len);
+    fwrite(header, 1, HEADER_SIZE, out);
+
+    /* 2) Organizasyon metnini yaz  32] */
+    fwrite(org, 1, org_len, out);
+
+    /* 3) Tüm dosyaların içeriklerini (data) ardışık olarak arşive ekle  */
+    for (int i = 0; i < entry_count; i++) {
+        fwrite(entries[i].data, 1, entries[i].size, out);
+    }
+
+    fclose(out);
+    free(org);
+    free_entries(entries, entry_count);
+
+    printf("Dosyalar birleştirildi.\n"); /* Başarılı çıktı mesajı  */
+    return 0;
+}
+
+/* Arşivden okunan ham organizasyon metnini ayrıştırarak dosya bilgilerini Struct yapısına doldurur   */
+static int parse_org_section(const char *org, size_t org_len, ArchiveEntry *entries, int *entry_count) {
+    const char *cursor = org;
+    const char *end = org + org_len;
+    int count = 0;
+
+    while (cursor < end) {
+        /* Her kayıt mutlaka '|' karakteri ile başlamalıdır  */
+        if (*cursor != '|') {
+            return 0;
+        }
+        cursor++;
+
+        /* Kaydın bittiği yerdeki '|' işaretini bul   */
+        const char *record_end = strchr(cursor, '|');
+        if (!record_end || record_end >= end) {
+            return 0;
+        }
+
+        char record[512];
+        size_t record_len = (size_t)(record_end - cursor);
+        if (record_len >= sizeof(record)) {
+            return 0;
+        }
+
+        memcpy(record, cursor, record_len);
+        record[record_len] = '\0';
+
+        char name[256];
+        unsigned int mode = 0;
+        unsigned long long size_val = 0;
+
+        /* Virgülle ayrılmış alanları ayıkla: dosya_adi, izin, boyut   */
+        if (sscanf(record, "%255[^,],%o,%llu", name, &mode, &size_val) != 3) {
+            return 0;
+        }
+
+        strncpy(entries[count].name, name, sizeof(entries[count].name) - 1);
+        entries[count].mode = (mode_t)mode;
+        entries[count].size = (size_t)size_val;
+        entries[count].data = NULL;
+        count++;
+        cursor = record_end + 1; /* Bir sonraki kayda geç */
+    }
+
+    *entry_count = count;
+    return count > 0;
+}
+
+/* `.sau` uzantılı arşiv dosyasını okur ve dosyaları orijinal izinleriyle klasöre çıkartır  */
+static int extract_archive(const char *archive_path, const char *target_dir) {
+    /* Dosya uzantısının `.sau` olup olmadığını doğrula*/
+    size_t path_len = archive_path ? strlen(archive_path) : 0;
+    if (path_len < 5 || strcmp(archive_path + path_len - 4, ".sau") != 0) {
+        printf("Arşiv dosyası uygunsuz veya bozuk!\n"); /*   */
+        return 1;
+    }
+
+    FILE *fp = fopen(archive_path, "rb");
+    if (!fp) {
+        printf("Arşiv dosyası uygunsuz veya bozuk!\n"); /*  */
+        return 1;
+    }
+
+    /* İlk 10 baytlık başlığı oku  34] */
+    char header[HEADER_SIZE + 1];
+    if (fread(header, 1, HEADER_SIZE, fp) != HEADER_SIZE) {
+        fclose(fp);
+        printf("Arşiv dosyası uygunsuz veya bozuk!\n"); /*   */
+        return 1;
+    }
+    header[HEADER_SIZE] = '\0';
+
+    /* Organizasyon bölümünün uzunluğunu oku  34] */
+    size_t org_len = 0;
+    if (sscanf(header, "%10zu", &org_len) != 1) {
+        fclose(fp);
+        printf("Arşiv dosyası uygunsuz veya bozuk!\n"); /*  ] */
+        return 1;
+    }
+
+    /* Organizasyon bölümünü hafızaya oku  33] */
+    char *org = malloc(org_len + 1);
+    if (!org) {
+        fclose(fp);
+        printf("Arşiv dosyası uygunsuz veya bozuk!\n"); /*   */
+        return 1;
+    }
+
+    if (fread(org, 1, org_len, fp) != org_len) {
+        free(org);
+        fclose(fp);
+        printf("Arşiv dosyası uygunsuz veya bozuk!\n"); /*   */
+        return 1;
+    }
+    org[org_len] = '\0';
+
+    ArchiveEntry entries[MAX_FILES];
+    int entry_count = 0;
+    memset(entries, 0, sizeof(entries));
+
+    /* Organizasyon metnini çözerek yapı dizisini doldur  33] */
+    if (!parse_org_section(org, org_len, entries, &entry_count)) {
+        free(org);
+        fclose(fp);
+        printf("Arşiv dosyası uygunsuz veya bozuk!\n"); /*   */
+        return 1;
+    }
+
+    /* Arşiv içindeki ardışık ham ham verileri, dosya boyutlarına göre sırayla oku  */
+    for (int i = 0; i < entry_count; i++) {
+        entries[i].data = malloc(entries[i].size + 1);
+        if (!entries[i].data) {
+            free(org);
+            fclose(fp);
+            free_entries(entries, i);
+            printf("Arşiv dosyası uygunsuz veya bozuk!\n"); /*   */
+            return 1;
+        }
+
+        if (fread(entries[i].data, 1, entries[i].size, fp) != entries[i].size) {
+            free(org);
+            fclose(fp);
+            free_entries(entries, entry_count);
+            printf("Arşiv dosyası uygunsuz veya bozuk!\n"); /*   */
+            return 1;
+        }
+        entries[i].data[entries[i].size] = '\0';
+    }
+
+    fclose(fp);
+    free(org);
+
+    /* Hedef dizin parametresi girilmişse kontrol et/oluştur  */
+    if (target_dir && target_dir[0] != '\0') {
+        if (!ensure_directory(target_dir)) {
+            free_entries(entries, entry_count);
+            return 1;
+        }
+    }
+
+    /* Çıkarılan dosyaları diske yaz ve izinlerini ata  ] */
+    for (int i = 0; i < entry_count; i++) {
+        char out_path[MAX_PATH_LEN];
+        if (target_dir && target_dir[0] != '\0') {
+            snprintf(out_path, sizeof(out_path), "%s/%s", target_dir, entries[i].name);
+        } else {
+            snprintf(out_path, sizeof(out_path), "%s", entries[i].name);
+        }
+
+        FILE *out = fopen(out_path, "wb");
+        if (!out) {
+            free_entries(entries, entry_count);
+            return 1;
+        }
+
+        fwrite(entries[i].data, 1, entries[i].size, out);
+        fclose(out);
+
+        /* Dosyanın orijinal Linux izinlerini sisteme uygula (rwx)   */
+        chmod(out_path, entries[i].mode);
+    }
+
+    /* Ekrana ödev formatına uygun çıktı metnini bas  */
+    if (target_dir && target_dir[0] != '\0') {
+        printf("%s dizininde ", target_dir); /*  */
+    } else {
+        printf("mevcut dizinde ");
+    }
+
+    for (int i = 0; i < entry_count; i++) {
+        if (i > 0) {
+            printf(", ");
+        }
+        printf("%s", entries[i].name); /*  */
+    }
+    printf(" dosyaları açıldı.\n"); /*  */
+
+    free_entries(entries, entry_count);
+    return 0;
+}
+
+/* Bazı işletim sistemlerinde veya kopyalamalarda komut satırındaki tire (`-`) işaretinin */
+/* geniş tire (`–`) karakterine dönüşmesi hatasını normalize ederek çözer   */
+static const char *normalize_option(const char *arg) {
+    if (!arg) {
+        return NULL;
+    }
+    if (strcmp(arg, "-b") == 0 || strcmp(arg, "–b") == 0) {
+        return "-b";
+    }
+    if (strcmp(arg, "-a") == 0 || strcmp(arg, "–a") == 0) {
+        return "-a";
+    }
+    if (strcmp(arg, "-o") == 0 || strcmp(arg, "–o") == 0) {
+        return "-o";
+    }
+    return arg;
+}
+
+/* Programın ana giriş noktası. Komut satırı argümanlarını (CLI) yönetir  ] */
+int main(int argc, char *argv[]) {
+    /* Eksik parametre kontrolü */
+    if (argc < 2) {
+        fprintf(stderr, "Kullanım: tarsau -b <dosyalar...> [-o cikti.sau]\n");
+        fprintf(stderr, "         tarsau -a <arsiv.sau> [dizin]\n");
+        return 1;
+    }
+
+    const char *mode = normalize_option(argv[1]);
+
+    /* Birleştirme modu tetiklendiyse (`-b`)  11] */
+    if (strcmp(mode, "-b") == 0) {
+        const char *output = "a.sau"; /* Varsayılan çıktı dosyası adı   */
+        const char *inputs[MAX_FILES];
+        int input_count = 0;
+
+        /* Parametreleri tara */
+        for (int i = 2; i < argc; i++) {
+            const char *arg = normalize_option(argv[i]);
+            /* Eğer `-o` parametresi gördüysen bir sonraki argümanı çıktı dosyası adı yap   */
+            if (strcmp(arg, "-o") == 0) {
+                if (i + 1 >= argc) {
+                    return 1;
+                }
+                output = argv[++i];
+                continue;
+            }
+
+            /* Maksimum 32 dosya sınırını denetle  19] */
+            if (input_count >= MAX_FILES) {
+                fprintf(stderr, "En fazla 32 giriş dosyası desteklenir.\n"); 
+                return 1;
+            }
+
+            inputs[input_count++] = argv[i];
+        }
+
+        if (input_count == 0) {
+            fprintf(stderr, "Birleştirilecek dosya belirtilmedi.\n");
+            return 1;
+        }
+
+        return build_archive(inputs, input_count, output);
+    }
+
+    /* Arşivden çıkarma modu tetiklendiyse (`-a`)  ] */
+    if (strcmp(mode, "-a") == 0) {
+        /* `-a` parametresinden sonra en fazla 2 ek parametre gelebilir  ] */
+        if (argc < 3 || argc > 4) {
+            fprintf(stderr, "Kullanım: tarsau -a <arsiv.sau> [dizin]\n");
+            return 1;
+        }
+
+        const char *archive = argv[2];                   /* İlk parametre arşiv dosyası adı  ] */
+        const char *dir = (argc == 4) ? argv[3] : NULL;  /* İkinci parametre varsa hedef dizin ] */
+        return extract_archive(archive, dir);
+    }
+
+    fprintf(stderr, "Bilinmeyen komut: %s\n", argv[1]);
+    return 1;
+}
