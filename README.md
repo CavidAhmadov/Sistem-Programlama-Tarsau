@@ -28,4 +28,3 @@ Açıklama: Farklı terminal emülatörlerinde oluşabilecek geniş tire (–) h
 
 Kritik Fonksiyonlar: normalize_option()
 
-Git Commit Mesajı: fix: add CLI parameter normalization and boundary error handling
